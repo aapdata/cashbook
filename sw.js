@@ -1,4 +1,4 @@
-const CACHE_NAME = 'cashbook-shell-v4';
+const CACHE_NAME = 'cashbook-shell-v6';
 const SHELL_FILES = ['./manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {

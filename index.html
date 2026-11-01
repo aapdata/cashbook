@@ -158,6 +158,9 @@
   .close-sheet{ display:block; margin: 14px auto 0 auto; background:none; border: 1px solid var(--ink); padding: 8px 20px; border-radius: 5px; font-family:'Inter'; cursor:pointer; }
   .toast{ position:fixed; bottom: 20px; left:50%; transform: translateX(-50%); background: var(--ink); color: var(--paper); padding: 10px 18px; border-radius: 20px; font-size: 13px; z-index: 40; opacity:0; transition: opacity 0.25s; pointer-events:none; white-space:nowrap; text-align:center; max-width:85vw; }
   .toast.show{ opacity:1; }
+  .savestat{ position:fixed; left:12px; bottom:12px; font-size:12px; padding:4px 10px; border-radius:12px; background:#fff; border:1px solid var(--rule); z-index:30; display:none; color:var(--ink-soft); }
+  .savestat.busy, .savestat.err{ display:block; }
+  .savestat.err{ color:#a13d3d; border-color:#a13d3d; }
   .locked-note{ text-align:center; font-size: 12.5px; color: var(--ink-soft); padding: 10px 0 0 0; font-style: italic; }
 
   .login-wrap{ text-align:center; padding: 8px 4px 4px 4px; }
@@ -284,6 +287,7 @@
     </div>
     <button class="add-btn" style="margin-top:14px; background:transparent; color:var(--ink); border:1px solid var(--ink);" onclick="switchUser()">Switch User (Log Out)</button>
     <button class="add-btn" style="margin-top:8px; background:transparent; color:var(--payment); border:1px solid var(--payment);" onclick="signOutDevice()">Sign out this device</button>
+    <button class="add-btn" style="margin-top:8px; background:transparent; color:var(--ink); border:1px solid var(--rule);" onclick="recalcAllNow()">Recalculate all days' balances</button>
     <button class="add-btn" style="margin-top:8px; background:transparent; color:var(--ink); border:1px solid var(--rule);" onclick="importOld()">Import data from old cash book</button>
     <button class="close-sheet" onclick="closeUsers()">Close</button>
   </div>
@@ -300,12 +304,13 @@
 <div class="overlay hidden" id="exportOverlay">
   <div class="sheet">
     <h2>Export Cash Book</h2>
-    <p class="sub">Downloads every entry from every day, with each person's opening, closing, actual count and difference, as a ready-to-open Excel (.xlsx) file.</p>
+    <p class="sub">One sheet per month: receipts on the left, payments on the right, a column for each person, with Total, Closing and actual-vs-book difference for every day.</p>
     <button class="add-btn" onclick="doExport()">Download Excel (.xlsx)</button>
     <button class="close-sheet" onclick="closeExport()">Close</button>
   </div>
 </div>
 
+<div class="savestat" id="saveStat"></div>
 <div class="toast" id="toast"></div>
 
 <script type="module">
@@ -393,9 +398,23 @@ async function idbGet(k){ try{ const d=await idbOpen(); return await new Promise
 async function idbSet(k,v){ try{ const d=await idbOpen(); await new Promise((res,rej)=>{ const t=d.transaction('k','readwrite'); t.objectStore('k').put(v,k); t.oncomplete=res; t.onerror=()=>rej(t.error); }); }catch(e){ console.error(e); } }
 async function idbDel(k){ try{ const d=await idbOpen(); await new Promise((res,rej)=>{ const t=d.transaction('k','readwrite'); t.objectStore('k').delete(k); t.oncomplete=res; t.onerror=()=>rej(t.error); }); }catch(e){} }
 
+// Start several reads at once (they don't need the key yet) so the app isn't waiting on them one by one.
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), ms))]);
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+const rawCache = {};
+function rawFetch(key){
+  const p = getDoc(doc(db, 'cashbook', key));
+  p.catch(()=>{});            // avoid "unhandled rejection" if nobody asks for it
+  rawCache[key] = { t: Date.now(), p: p };
+}
+function getSnap(key){
+  const c = rawCache[key];
+  if(c){ delete rawCache[key]; if(Date.now() - c.t < 60000) return c.p; }
+  return getDoc(doc(db, 'cashbook', key));
+}
 async function safeGet(key){
   try{
-    const snap = await getDoc(doc(db, 'cashbook', key));
+    const snap = await withTimeout(getSnap(key), 25000);
     if(!snap.exists()) return null;
     const d = snap.data();
     if(!d.enc) return null;
@@ -405,8 +424,9 @@ async function safeGet(key){
 async function safeSet(key, value){
   if(readFailed){ showToast('Connection problem — close and reopen the app before saving'); return false; }
   try{
+    delete rawCache[key];
     const enc = await encryptJSON(value);
-    await setDoc(doc(db, 'cashbook', key), { enc: enc, updatedAt: Date.now() });
+    await withTimeout(setDoc(doc(db, 'cashbook', key), { enc: enc, updatedAt: Date.now() }), 20000);
     return true;
   }catch(e){ console.error(e); showToast('Save failed — try again'); return false; }
 }
@@ -507,60 +527,175 @@ async function removePerson(id){
   showToast('Removed — their past entries stay in the records');
 }
 
-/* ---------- DAY DATA ---------- */
-async function loadMeta(){ state.meta = await safeGet('meta') || { daysIndex: [], userCarry: {} }; if(!state.meta.userCarry) state.meta.userCarry = {}; }
-async function saveMeta(){ await safeSet('meta', state.meta); }
-
-function freshBalanceFor(userId){
-  const carry = state.meta.userCarry[userId];
-  return carry ? { opening: carry.balance, openingManual: false, openingConfirmed: false, actualCash: '' } : { opening: 0, openingManual: true, openingConfirmed: false, actualCash: '' };
+/* ---------- DAY DATA ----------
+   Opening of every day = previous day's carry (actual cash if it was counted, else book closing).
+   Whenever any day changes, all later days are re-chained automatically, closed or not. */
+const round2 = n => Math.round((Number(n)||0)*100)/100;
+const memDays = {};   // prefetched day docs (promises), used once
+function memFetch(key){
+  const m = memDays[key];
+  if(m){ delete memDays[key]; if(Date.now() - m.t < 120000) return m.p; }
+  return safeGet(key);
+}
+function memPrefetch(key){ const p = safeGet(key); p.catch(()=>{}); memDays[key] = { t: Date.now(), p }; }
+async function loadMeta(){
+  state.meta = await safeGet('meta') || { daysIndex: [], userCarry: {} };
+  if(!state.meta.userCarry) state.meta.userCarry = {};
+  if(!state.meta.daysIndex) state.meta.daysIndex = [];
+}
+async function saveMeta(){ return await safeSet('meta', state.meta); }
+function prevDateOf(iso){ let p = null; for(const d of state.meta.daysIndex){ if(d < iso && (!p || d > p)) p = d; } return p; }
+function freshBalanceFor(userId){ return { opening: 0, openingManual: true, openingConfirmed: false, actualCash: '' }; }
+function normalizeDay(day){
+  if(!day) day = { balances: {}, entries: [], closed: false, closedBy: null };
+  if(!day.balances) day.balances = {};
+  if(!day.entries) day.entries = [];
+  if(!day.deleted) day.deleted = [];
+  if(day.closedBy === undefined) day.closedBy = null;
+  for(const u of config.users){ if(!day.balances[u.id]) day.balances[u.id] = freshBalanceFor(u.id); }
+  return day;
+}
+function carryOf(day, uid){
+  const t = userTotals(day, uid);
+  return (t.actual !== '' && t.actual !== null && t.actual !== undefined) ? round2(t.actual) : t.closing;
+}
+// set this day's openings from the previous day. hasSet = people who really existed on the previous day.
+function chainOpenings(day, prevDay, hasSet){
+  let changed = false;
+  for(const u of config.users){
+    if(hasSet && !hasSet.has(u.id)) continue;
+    const c = carryOf(prevDay, u.id), bal = day.balances[u.id];
+    if(round2(bal.opening) !== c || bal.openingManual){ bal.opening = c; bal.openingManual = false; changed = true; }
+  }
+  return changed;
 }
 async function loadDay(iso){
-  let day = await safeGet('day:'+iso);
-  if(!day){ day = { balances: {}, entries: [], closed: false, closedBy: null }; }
-  if(!day.balances) day.balances = {};
-  if(day.closedBy === undefined) day.closedBy = null;
-  for(const u of config.users){
-    let bal = day.balances[u.id];
-    if(!bal){
-      day.balances[u.id] = freshBalanceFor(u.id);
-      continue;
-    }
-    // Opening balance is never something to manually edit once this person has
-    // ever closed a day before — it always, unconditionally, tracks the latest
-    // carried-forward figure for as long as this day itself isn't closed.
-    // This is what makes retroactive corrections work correctly: if someone
-    // goes back and fixes an earlier day (adds a forgotten entry, corrects
-    // their actual count, then re-closes it), every later still-open day for
-    // that same person re-syncs to the corrected figure the next time it's
-    // loaded — while their own entries on those later days are never touched,
-    // only the baseline they're calculated against.
-    // Manual opening entry only ever applies to a person's very first day,
-    // before any carry-forward exists for them at all.
-    if(!day.closed){
-      const carry = state.meta.userCarry[u.id];
-      if(carry){
-        bal.opening = carry.balance;
-        bal.openingManual = false;
-      }
-    }
+  const pd = prevDateOf(iso);
+  const [cur, prevRaw] = await Promise.all([ memFetch('day:'+iso), pd ? memFetch('day:'+pd) : null ]);
+  const existed = !!cur;
+  const day = normalizeDay(cur);
+  if(prevRaw){
+    const changed = chainOpenings(day, normalizeDay(JSON.parse(JSON.stringify(prevRaw))), new Set(Object.keys(prevRaw.balances||{})));
+    if(changed && existed && !readFailed) queueSave(iso, day);   // quietly heal a stale opening
   }
   return day;
 }
 function ensureDayHasAllUsers(){
   for(const u of config.users){ if(!state.day.balances[u.id]) state.day.balances[u.id] = freshBalanceFor(u.id); }
 }
-async function saveDay(iso, day){
-  const ok = await safeSet('day:'+iso, day);
-  if(ok && !state.meta.daysIndex.includes(iso)){ state.meta.daysIndex.push(iso); state.meta.daysIndex.sort(); await saveMeta(); }
-  return ok;
+
+/* saving: the screen updates at once, the network write happens in the background (one at a time) */
+const saveQ = { map: new Map(), running: false, ver: 0 };
+function setSaveStat(st){
+  const el = document.getElementById('saveStat'); if(!el) return;
+  el.className = 'savestat' + (st==='busy' ? ' busy' : st==='err' ? ' err' : '');
+  el.textContent = st==='busy' ? 'Saving…' : st==='err' ? 'Not saved yet — retrying' : '';
+}
+function queueSave(iso, day){ saveQ.map.set(iso, { day, v: ++saveQ.ver }); setSaveStat('busy'); pumpSaves(); }
+function saveDay(iso, day){ queueSave(iso, day); return true; }
+async function pumpSaves(){
+  if(saveQ.running) return; saveQ.running = true;
+  try{
+    let fails = 0;
+    while(saveQ.map.size){
+      const [iso, item] = saveQ.map.entries().next().value;
+      let ok = false;
+      try{ ok = await persistDay(iso, item); }catch(e){ console.error(e); }
+      if(ok){ if(saveQ.map.get(iso) === item) saveQ.map.delete(iso); fails = 0; }
+      else { fails++; setSaveStat('err'); if(readFailed) break; await sleep(Math.min(3000*fails, 15000)); }
+    }
+    if(!saveQ.map.size) setSaveStat('ok');
+  } finally { saveQ.running = false; }
+}
+async function readDayRaw(iso){
+  const s = await withTimeout(getDoc(doc(db,'cashbook','day:'+iso)), 20000);
+  if(!s.exists()) return null;
+  const d = s.data(); return d.enc ? await decryptJSON(d.enc) : null;
+}
+async function writeDayRaw(iso, day){
+  await withTimeout(setDoc(doc(db,'cashbook','day:'+iso), { enc: await encryptJSON(day), updatedAt: Date.now() }), 20000);
+}
+// two phones editing the same day: keep everyone's entries, honour deletions
+function mergeDay(fresh, local){
+  if(!fresh) return local;
+  const del = new Set([...(fresh.deleted||[]), ...(local.deleted||[])]);
+  const mine = new Set(local.entries.map(e=>e.id));
+  const entries = [...local.entries.filter(e=>!del.has(e.id)), ...(fresh.entries||[]).filter(e=>!mine.has(e.id) && !del.has(e.id))];
+  entries.sort((x,y)=> String(x.time||'').localeCompare(String(y.time||'')));
+  return { ...local, entries, deleted: [...del].slice(-300) };
+}
+async function persistDay(iso, item){
+  if(readFailed){ showToast('Connection problem — close and reopen the app'); return false; }
+  const snap = JSON.parse(JSON.stringify(item.day));
+  let fresh = null;
+  try{ fresh = await readDayRaw(iso); }catch(e){ console.error(e); return false; }
+  const merged = mergeDay(fresh, snap);
+  try{ await writeDayRaw(iso, merged); }catch(e){ console.error(e); return false; }
+  if(iso === state.date && state.day && saveQ.map.get(iso) === item){
+    const same = merged.entries.length === state.day.entries.length && merged.entries.every((e,i)=>e.id === state.day.entries[i].id);
+    if(!same){ state.day.entries = merged.entries; state.day.deleted = merged.deleted; render(); }
+  }
+  if(!state.meta.daysIndex.includes(iso)) await addToIndex(iso);
+  await recalcFrom(iso, merged);
+  return true;
+}
+async function addToIndex(iso){
+  let m = null;
+  try{ const s = await withTimeout(getDoc(doc(db,'cashbook','meta')), 20000); if(s.exists() && s.data().enc) m = await decryptJSON(s.data().enc); }catch(e){ throw e; }
+  if(!m) m = state.meta;
+  const idx = new Set([...(m.daysIndex||[]), ...state.meta.daysIndex, iso]);
+  state.meta = { ...m, userCarry: m.userCarry || {}, daysIndex: [...idx].sort() };
+  await saveMeta();
+}
+// after a day changes, walk forward and fix openings of later days until nothing changes
+async function recalcFrom(iso, baseRaw){
+  const later = state.meta.daysIndex.filter(d => d > iso).sort();
+  let prev = normalizeDay(JSON.parse(JSON.stringify(baseRaw)));
+  let has = new Set(Object.keys(baseRaw.balances||{}));
+  for(const d of later){
+    const raw = await readDayRaw(d); if(!raw) continue;
+    const day = normalizeDay(raw);
+    const changed = chainOpenings(day, prev, has);
+    if(!changed) break;
+    await writeDayRaw(d, day);
+    if(d === state.date && state.day){
+      for(const u of config.users){ state.day.balances[u.id].opening = day.balances[u.id].opening; state.day.balances[u.id].openingManual = day.balances[u.id].openingManual; }
+      render();
+    }
+    prev = day; has = new Set(Object.keys(raw.balances||{}));
+  }
+}
+// one-time: re-chain every day from the beginning so old wrong openings are corrected
+async function fullRecalc(){
+  const dates = [...state.meta.daysIndex].sort();
+  let fixed = 0;
+  if(dates.length >= 2){
+    const raws = await Promise.all(dates.map(readDayRaw));
+    let prev = null, has = null;
+    for(let i=0;i<dates.length;i++){
+      const raw = raws[i]; if(!raw) continue;
+      const day = normalizeDay(raw);
+      if(prev && chainOpenings(day, prev, has)){ await writeDayRaw(dates[i], day); fixed++; if(dates[i]===state.date && state.day){ for(const u of config.users) state.day.balances[u.id].opening = day.balances[u.id].opening; } }
+      prev = day; has = new Set(Object.keys(raw.balances||{}));
+    }
+  }
+  state.meta.chainV = 2;
+  await saveMeta();
+  return fixed;
+}
+async function recalcAllNow(){
+  if(readFailed){ showToast('Connection problem — reopen the app'); return; }
+  showToast('Checking all days…');
+  try{ const n = await fullRecalc(); showToast(n ? ('Fixed ' + n + ' day' + (n>1?'s':'')) : 'All days already correct'); render(); }
+  catch(e){ console.error(e); showToast('Could not finish — try again'); }
 }
 function userTotals(day, userId){
   let receipts=0, payments=0;
   for(const e of day.entries){ if(e.by!==userId) continue; if(e.type==='in') receipts+=Number(e.amount); else payments+=Number(e.amount); }
+  receipts = round2(receipts); payments = round2(payments);
   const bal = day.balances[userId] || freshBalanceFor(userId);
-  const closing = Number(bal.opening) + receipts - payments;
-  return { receipts, payments, closing, opening: Number(bal.opening), actual: bal.actualCash };
+  const closing = round2(Number(bal.opening) + receipts - payments);
+  return { receipts, payments, closing, opening: round2(bal.opening), actual: bal.actualCash };
 }
 function dayGrandTotals(day){
   let receipts=0, payments=0, opening=0, closing=0, actualKnown=true, actual=0;
@@ -574,7 +709,7 @@ function dayGrandTotals(day){
     if(e.isContra) continue;
     if(e.type==='in') extReceipts += Number(e.amount); else extPayments += Number(e.amount);
   }
-  return { receipts, payments, opening, closing, actual, actualKnown, extReceipts, extPayments };
+  return { receipts: round2(receipts), payments: round2(payments), opening: round2(opening), closing: round2(closing), actual: round2(actual), actualKnown, extReceipts: round2(extReceipts), extPayments: round2(extPayments) };
 }
 function userById(id){ return (config.users||[]).find(u=>u.id===id) || { name:'Unknown', color:'#999' }; }
 
@@ -588,15 +723,14 @@ async function render(){
   const openingsList = document.getElementById('openingsList');
   openingsList.innerHTML = config.users.map(u=>{
     const bal = state.day.balances[u.id];
-    const hasEverClosedBefore = !!state.meta.userCarry[u.id];
-    const editable = !hasEverClosedBefore && !state.day.closed;
+    const editable = !!bal.openingManual;
     return `<div class="open-row">
       <div class="who"><span class="badge" style="background:${u.color}">${initials(u.name)}</span>${escapeHtml(u.name)}</div>
       ${editable ? `<input type="number" inputmode="decimal" class="openInput" data-uid="${u.id}" value="${bal.opening||''}" placeholder="0">` : `<span class="amt">${fmt(bal.opening)}</span>`}
     </div>`;
   }).join('');
   document.querySelectorAll('.openInput').forEach(inp=>{
-    inp.onchange = async (e)=>{ const uid=e.target.dataset.uid; state.day.balances[uid].opening = Number(e.target.value)||0; await saveDay(state.date, state.day); render(); };
+    inp.onchange = (e)=>{ if(!canEdit()){ render(); return; } const uid=e.target.dataset.uid; state.day.balances[uid].opening = Number(e.target.value)||0; saveDay(state.date, state.day); render(); };
   });
 
   // entries
@@ -611,7 +745,7 @@ async function render(){
         <div class="by"><span class="badge" style="background:${u.color}" title="${escapeHtml(u.name)}">${initials(u.name)}</span></div>
         <div class="particulars">${e.isContra?'<span class="contra-tag">&#8646; Contra</span> ':''}${escapeHtml(e.particulars)}${e.important?' &#9733;':''}</div>
         <div class="amt ${e.type==='in'?'receipt':'payment'}">${fmtSigned(e.amount, e.type)}</div>
-        ${state.day.closed ? '' : `<button class="del" onclick="deleteEntry('${e.id}')">&#10005;</button>`}
+        <button class="del" onclick="deleteEntry('${e.id}')">&#10005;</button>
       </div>`;
     }).join('');
   }
@@ -642,12 +776,12 @@ async function render(){
       <div class="line"><span>Receipts</span><span class="amt-in" style="font-family:'IBM Plex Mono',monospace">${fmt(t.receipts)}</span></div>
       <div class="line"><span>Payments</span><span class="amt-out" style="font-family:'IBM Plex Mono',monospace">${fmt(t.payments)}</span></div>
       <div class="line"><strong>Book Closing</strong><strong style="font-family:'IBM Plex Mono',monospace">${fmt(t.closing)}</strong></div>
-      <div class="line"><span>Actual cash counted</span><input type="number" inputmode="decimal" class="actualInput" data-uid="${u.id}" value="${t.actual}" placeholder="0" ${state.day.closed?'disabled':''}></div>
+      <div class="line"><span>Actual cash counted</span><input type="number" inputmode="decimal" class="actualInput" data-uid="${u.id}" value="${t.actual}" placeholder="0"></div>
       <div class="line"><span>Difference</span>${diffHtml}</div>
     </div>`;
   }).join('');
   document.querySelectorAll('.actualInput').forEach(inp=>{
-    inp.onchange = async (e)=>{ const uid=e.target.dataset.uid; state.day.balances[uid].actualCash = e.target.value==='' ? '' : Number(e.target.value); await saveDay(state.date, state.day); render(); };
+    inp.onchange = (e)=>{ if(!canEdit()){ render(); return; } const uid=e.target.dataset.uid; state.day.balances[uid].actualCash = e.target.value==='' ? '' : Number(e.target.value); saveDay(state.date, state.day); render(); };
   });
 
   const banner = document.getElementById('statusBanner');
@@ -671,11 +805,8 @@ async function render(){
 
   const formArea = document.getElementById('formArea');
   const lockedNote = document.getElementById('lockedNote');
-  if(state.day.closed){
-    formArea.innerHTML = `<div class="actions"><button onclick="reopenDay()">Reopen Day</button></div>`;
-    lockedNote.innerHTML = `<div class="locked-note">This day is closed. Reopen to edit entries.</div>`;
-  } else {
-    lockedNote.innerHTML = '';
+  {
+    lockedNote.innerHTML = state.day.closed ? `<div class="locked-note">This day is closed. You can still correct it — later days update by themselves.</div>` : '';
     const otherUsersOptionsFor = (excludeId) => config.users.filter(u=>u.id!==excludeId).map(u=>`<option value="${u.id}">${escapeHtml(u.name)}</option>`).join('');
     formArea.innerHTML = `
       <div class="addform">
@@ -704,7 +835,7 @@ async function render(){
         <input type="number" inputmode="decimal" id="contraAmount" placeholder="Amount">
         <button class="add-btn" onclick="addContraEntry()">Record Transfer</button>
       </div>` : ''}` : ''}
-      <div class="actions"><button class="primary" onclick="closeDay()">Close Day &amp; Carry Forward</button></div>
+      <div class="actions">${state.day.closed ? `<button onclick="reopenDay()">Mark day as open</button>` : `<button class="primary" onclick="closeDay()">Close Day &amp; Carry Forward</button>`}</div>
     `;
     setTimeout(()=>{
       const pi = document.getElementById('particularsInput'); const ai = document.getElementById('amountInput');
@@ -716,6 +847,13 @@ async function render(){
   }
 }
 
+function canEdit(){
+  if(state.day && state.day.closed && state.confirmedFor !== state.date){
+    if(!confirm('Yeh din close ho chuka hai.\n\nBadlav karoge to aage ke dino ka opening/balance apne aap badal jayega. Continue?')) return false;
+    state.confirmedFor = state.date;
+  }
+  return true;
+}
 function toggleContraForm(){ state.contraOpen = !state.contraOpen; render(); }
 function contraFromChanged(){
   const fromSel = document.getElementById('contraFrom');
@@ -725,6 +863,7 @@ function contraFromChanged(){
   toSel.innerHTML = config.users.filter(u=>u.id!==fromId).map(u=>`<option value="${u.id}">${escapeHtml(u.name)}</option>`).join('');
 }
 async function addContraEntry(){
+  if(!canEdit()) return;
   const fromId = document.getElementById('contraFrom').value;
   const toId = document.getElementById('contraTo').value;
   const amount = Number(document.getElementById('contraAmount').value);
@@ -739,8 +878,8 @@ async function addContraEntry(){
   state.day.entries.push({ id: contraId+'-out', time: hh+':'+mm, particulars: noteOut, amount, type:'out', important:false, by: fromId, isContra:true, contraId });
   state.day.entries.push({ id: contraId+'-in', time: hh+':'+mm, particulars: noteIn, amount, type:'in', important:false, by: toId, isContra:true, contraId });
   state.contraOpen = false;
-  const ok = await saveDay(state.date, state.day);
-  if(ok) showToast('Transfer recorded');
+  saveDay(state.date, state.day);
+  showToast('Transfer recorded');
   render();
 }
 
@@ -748,41 +887,45 @@ function setType(t){ state.form.type = t; render(); }
 function toggleImportant(){ state.form.important = !state.form.important; render(); }
 
 async function addEntry(){
+  if(!canEdit()) return;
   const p = state.form.particulars.trim(); const a = Number(state.form.amount);
   if(!p || !a || a<=0){ showToast('Enter particulars and a valid amount'); return; }
   const now = new Date(); const hh=String(now.getHours()).padStart(2,'0'); const mm=String(now.getMinutes()).padStart(2,'0');
   state.day.entries.push({ id: Date.now().toString(36)+Math.random().toString(36).slice(2,6), time: hh+':'+mm, particulars: p, amount: a, type: state.form.type, important: state.form.important, by: currentUser.id });
   state.form = { type: state.form.type, particulars:'', amount:'', important:false };
-  const ok = await saveDay(state.date, state.day);
-  if(ok) showToast('Entry added');
+  saveDay(state.date, state.day);
+  showToast('Entry added');
   render();
 }
 async function deleteEntry(id){
+  if(!canEdit()) return;
   const target = state.day.entries.find(e=>e.id===id);
+  if(!state.day.deleted) state.day.deleted = [];
   if(target && target.isContra && target.contraId){
+    state.day.entries.filter(e=>e.contraId === target.contraId).forEach(e=>state.day.deleted.push(e.id));
     state.day.entries = state.day.entries.filter(e=>e.contraId !== target.contraId);
   } else {
+    state.day.deleted.push(id);
     state.day.entries = state.day.entries.filter(e=>e.id!==id);
   }
-  await saveDay(state.date, state.day);
+  saveDay(state.date, state.day);
   render();
 }
 
-async function closeDay(){
+function closeDay(){
   state.day.closed = true; state.day.closedBy = currentUser.id;
-  await saveDay(state.date, state.day);
-  for(const u of config.users){
-    const t = userTotals(state.day, u.id);
-    const carry = (t.actual !== '' && t.actual !== null && t.actual !== undefined) ? Number(t.actual) : t.closing;
-    state.meta.userCarry[u.id] = { date: state.date, balance: carry };
-  }
-  await saveMeta();
-  showToast('Day closed — each person\'s cash carried forward as tomorrow\'s opening');
+  saveDay(state.date, state.day);
+  showToast('Day closed — tomorrow\'s opening will follow automatically');
   render();
 }
-async function reopenDay(){ state.day.closed = false; await saveDay(state.date, state.day); showToast('Day reopened'); render(); }
+function reopenDay(){ state.day.closed = false; saveDay(state.date, state.day); showToast('Day marked open'); render(); }
 
+let navBusy = false;
 async function shiftDay(delta){
+  if(navBusy) return; navBusy = true;
+  try{ await shiftDay2(delta); } finally { navBusy = false; }
+}
+async function shiftDay2(delta){
   const d = new Date(state.date + 'T12:00:00'); d.setDate(d.getDate()+delta);
   state.date = toISODate(d); state.day = await loadDay(state.date);
   state.form = { type:'in', particulars:'', amount:'', important:false };
@@ -814,16 +957,86 @@ async function jumpTo(iso){ state.date = iso; state.day = await loadDay(iso); cl
 function openExport(){ document.getElementById('exportOverlay').classList.remove('hidden'); }
 function closeExport(){ document.getElementById('exportOverlay').classList.add('hidden'); }
 function csvCell(v){ const s = String(v==null?'':v); return '"' + s.replace(/"/g,'""') + '"'; }
+// Builds the month-wise Excel (receipts on the left, payments on the right, per-person columns)
+function buildCashbookWorkbook(ExcelJS, users, days){
+  const wb = new ExcelJS.Workbook();
+  const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const fmtFor = v => { const a = Math.abs(v); return a >= 10000000 ? '"₹"##\\,##\\,##\\,##0.00' : a >= 100000 ? '"₹"##\\,##\\,##0.00' : '"₹"#,##0.00'; };
+  const n = users.length, LC = 3, RP = 3 + n, RC = 4 + n, TOTC = 3 + 2*n;   // user cols on left start at 3, right particular at 3+n
+  const thin = { style:'thin', color:{ argb:'FFBFBFBF' } };
+  const border = { top:thin, left:thin, bottom:thin, right:thin };
+  const r2 = x => Math.round((Number(x)||0)*100)/100;
+  const dmy = iso => iso.slice(8,10) + '-' + iso.slice(5,7) + '-' + iso.slice(0,4);
+  const byMonth = {};
+  days.slice().sort((a,b)=>a.iso.localeCompare(b.iso)).forEach(d => { (byMonth[d.iso.slice(0,7)] = byMonth[d.iso.slice(0,7)] || []).push(d); });
+  const dayFigures = d => {
+    const per = {};
+    users.forEach(u => {
+      let rc = 0, py = 0;
+      d.day.entries.forEach(e => { if (e.by !== u.id) return; if (e.type === 'in') rc += Number(e.amount); else py += Number(e.amount); });
+      const bal = d.day.balances[u.id] || { opening:0, actualCash:'' };
+      const op = r2(bal.opening);
+      per[u.id] = { op, rc: r2(rc), py: r2(py), close: r2(op + rc - py), actual: (bal.actualCash === '' || bal.actualCash == null) ? null : Number(bal.actualCash) };
+    });
+    return per;
+  };
+  Object.keys(byMonth).sort().forEach(key => {
+    const ws = wb.addWorksheet(MON[+key.slice(5,7)-1] + ' ' + key.slice(0,4), { views:[{ state:'frozen', ySplit:1 }], pageSetup:{ orientation:'landscape', fitToPage:true, fitToWidth:1, fitToHeight:0 } });
+    ws.getColumn(1).width = 15; ws.getColumn(2).width = 30; ws.getColumn(RP).width = 30;
+    for (let i=0;i<n;i++){ ws.getColumn(LC+i).width = 16; ws.getColumn(RC+i).width = 16; }
+    const head = ['DATE','PARTICULAR', ...users.map(u=>u.name.toUpperCase()), 'PARTICULAR', ...users.map(u=>u.name.toUpperCase())];
+    const hr = ws.addRow(head); hr.font = { bold:true }; hr.eachCell(c => { c.border = border; c.fill = { type:'pattern', pattern:'solid', fgColor:{ argb:'FFEFE7D4' } }; });
+    const put = (row, col, val, o) => { const c = row.getCell(col); c.value = val; if (typeof val === 'number') { c.numFmt = fmtFor(val); c.alignment = { horizontal:'right' }; } if (o && o.bold) c.font = { bold:true }; return c; };
+    const frame = row => { for (let c=1;c<=TOTC;c++){ row.getCell(c).border = border; } };
+    const monthSum = {}; users.forEach(u => monthSum[u.id] = { op:null, rc:0, py:0 });
+    let firstDay = true;
+    byMonth[key].forEach(d => {
+      const f = dayFigures(d);
+      const L = [{ label:'Opening', vals: Object.fromEntries(users.map(u => [u.id, f[u.id].op])) }];
+      const R = [];
+      d.day.entries.forEach(e => { (e.type === 'in' ? L : R).push({ label: e.particulars, vals: { [e.by]: Number(e.amount) } }); });
+      const rows = Math.max(L.length, R.length);
+      for (let i=0;i<rows;i++){
+        const row = ws.addRow([]);
+        if (i === 0) row.getCell(1).value = dmy(d.iso);
+        if (L[i]){ row.getCell(2).value = L[i].label; users.forEach((u,k) => { if (L[i].vals[u.id] !== undefined) put(row, LC+k, L[i].vals[u.id]); }); }
+        if (R[i]){ row.getCell(RP).value = R[i].label; users.forEach((u,k) => { if (R[i].vals[u.id] !== undefined) put(row, RC+k, R[i].vals[u.id]); }); }
+        frame(row);
+      }
+      const tot = ws.addRow([]);
+      tot.getCell(2).value = 'TOTAL'; tot.getCell(RP).value = 'TOTAL';
+      users.forEach((u,k) => { put(tot, LC+k, r2(f[u.id].op + f[u.id].rc), { bold:true }); put(tot, RC+k, f[u.id].py, { bold:true }); });
+      tot.font = { bold:true }; frame(tot);
+      const clo = ws.addRow([]); clo.getCell(RP).value = 'CLOSING (BOOK)';
+      users.forEach((u,k) => put(clo, RC+k, f[u.id].close, { bold:true })); clo.font = { bold:true }; frame(clo);
+      if (users.some(u => f[u.id].actual !== null)){
+        const ac = ws.addRow([]); ac.getCell(RP).value = 'ACTUAL CASH COUNTED';
+        const df = ws.addRow([]); df.getCell(RP).value = 'DIFFERENCE (ACTUAL − BOOK)';
+        users.forEach((u,k) => { if (f[u.id].actual !== null){ put(ac, RC+k, f[u.id].actual); put(df, RC+k, r2(f[u.id].actual - f[u.id].close)); } });
+        frame(ac); frame(df);
+      }
+      ws.addRow([]);
+      users.forEach(u => { const m = monthSum[u.id]; if (firstDay) m.op = f[u.id].op; m.rc += f[u.id].rc; m.py += f[u.id].py; });
+      firstDay = false;
+    });
+    const t = ws.addRow([]); t.getCell(1).value = 'MONTH TOTAL'; t.getCell(2).value = 'Opening + Receipts'; t.getCell(RP).value = 'Payments';
+    users.forEach((u,k) => { const m = monthSum[u.id]; put(t, LC+k, r2(m.op + m.rc), { bold:true }); put(t, RC+k, r2(m.py), { bold:true }); }); t.font = { bold:true }; frame(t);
+    const c2 = ws.addRow([]); c2.getCell(RP).value = 'MONTH CLOSING (BOOK)';
+    users.forEach((u,k) => { const m = monthSum[u.id]; put(c2, RC+k, r2(m.op + m.rc - m.py), { bold:true }); }); c2.font = { bold:true }; frame(c2);
+  });
+  return wb;
+}
+
 let xlsxLibPromise = null;
 function loadXLSXLib(){
-  if(window.XLSX) return Promise.resolve();
+  if(window.ExcelJS) return Promise.resolve();
   if(xlsxLibPromise) return xlsxLibPromise;
   xlsxLibPromise = new Promise((resolve, reject)=>{
-    const s = document.createElement('script');
-    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
-    s.onload = ()=>resolve();
-    s.onerror = ()=>reject(new Error('Failed to load Excel library'));
-    document.head.appendChild(s);
+    const sc = document.createElement('script');
+    sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js';
+    sc.onload = ()=>resolve();
+    sc.onerror = ()=>{ xlsxLibPromise = null; reject(new Error('Failed to load Excel library')); };
+    document.head.appendChild(sc);
   });
   return xlsxLibPromise;
 }
@@ -832,53 +1045,46 @@ async function doExport(){
   if(dates.length===0){ showToast('No entries to export yet'); return; }
   showToast('Preparing your Excel file…');
   try{ await loadXLSXLib(); }catch(e){ showToast('Could not load Excel export — check connection'); return; }
-  const rows = [['Date','Time','Entered By','Type','Particulars','Amount','Important','Contra','Person Opening','Person Book Closing','Person Actual Cash','Person Difference','Day Status']];
-  for(const iso of dates){
-    const d0 = await safeGet('day:'+iso); if(!d0) continue;
-    const d = { ...d0, balances: d0.balances||{} };
-    for(const u of config.users){ if(!d.balances[u.id]) d.balances[u.id] = freshBalanceFor(u.id); }
-    const perUser = {};
-    for(const u of config.users) perUser[u.id] = userTotals(d, u.id);
-    const byUsers = new Set();
-    for(const e of d.entries){
-      const u = userById(e.by); const t = perUser[e.by] || {};
-      const diff = (t.actual!=='' && t.actual!==null && t.actual!==undefined) ? (Number(t.actual)-t.closing) : '';
-      rows.push([iso, e.time||'', u.name, e.type==='in'?'Receipt':'Payment', e.particulars, e.amount, e.important?'Yes':'', e.isContra?'Yes':'', t.opening, t.closing, t.actual===''?'':t.actual, diff===''?'':diff, d.closed?'Closed':'Open']);
-      byUsers.add(e.by);
-    }
-    for(const u of config.users){
-      if(byUsers.has(u.id)) continue;
-      const t = perUser[u.id];
-      const diff = (t.actual!=='' && t.actual!==null && t.actual!==undefined) ? (Number(t.actual)-t.closing) : '';
-      rows.push([iso, '', u.name, '', '(no entries)', '', '', '', t.opening, t.closing, t.actual===''?'':t.actual, diff===''?'':diff, d.closed?'Closed':'Open']);
-    }
-  }
+  let raws;
+  try{ raws = await Promise.all(dates.map(readDayRaw)); }catch(e){ console.error(e); showToast('Could not read all days — try again'); return; }
+  const days = [];
+  dates.forEach((iso,i)=>{ if(raws[i]) days.push({ iso, day: normalizeDay(raws[i]) }); });
   try{
-    const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws['!cols'] = rows[0].map((_, colIdx) => {
-      const maxLen = rows.reduce((m, r) => Math.max(m, String(r[colIdx]==null?'':r[colIdx]).length), 8);
-      return { wch: Math.min(maxLen + 2, 30) };
-    });
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Cash Book');
-    XLSX.writeFile(wb, 'cash-book-export-' + toISODate(new Date()) + '.xlsx');
+    const wb = buildCashbookWorkbook(window.ExcelJS, config.users, days);
+    const buf = await wb.xlsx.writeBuffer();
+    const url = URL.createObjectURL(new Blob([buf], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+    const a = document.createElement('a'); a.href = url; a.download = 'cash-book-' + toISODate(new Date()) + '.xlsx';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
   }catch(e){
     console.error(e);
     showToast('Excel export failed — try again');
     return;
   }
-  showToast('CSV downloaded');
+  showToast('Excel downloaded');
 }
 
 /* ---------- BOOT ---------- */
+let preloadP = null;
+function startPreload(){
+  preloadP = (async()=>{
+    await loadMeta();
+    memPrefetch('day:'+state.date);
+    const pd = prevDateOf(state.date); if(pd) memPrefetch('day:'+pd);
+  })();
+  preloadP.catch(()=>{});
+}
 async function enterApp(){
-  await loadMeta();
+  const pre = preloadP; preloadP = null;
+  if(pre) await pre; else await loadMeta();
   state.day = await loadDay(state.date);
   document.getElementById('mainApp').style.display='block';
   render();
+  if(state.meta.chainV !== 2 && !readFailed){ fullRecalc().then(n=>{ if(n) showToast('Purane dino ka balance theek kiya (' + n + ')'); }).catch(e=>console.error(e)); }
 }
 async function afterKey(){
   readFailed = false;
+  startPreload();
   await loadConfig();
   if(!config && readFailed){
     showPass('retry', null, 'Could not load your data. Check the connection and try again.');
@@ -916,9 +1122,10 @@ function showPass(mode, meta, msg){
 }
 async function startApp(){
   document.getElementById('passOverlay').classList.add('hidden');
+  rawFetch('crypto'); rawFetch('config'); rawFetch('meta'); rawFetch('day:' + state.date);
   let meta = null;
   try{
-    const snap = await getDoc(doc(db, 'cashbook', 'crypto'));
+    const snap = await getSnap('crypto');
     if(snap.exists()) meta = snap.data();
   }catch(e){
     console.error(e);
@@ -1030,6 +1237,7 @@ async function signOutDevice(){
 window.doAuthLogin = doAuthLogin;
 window.doPass = doPass;
 window.importOld = importOld;
+window.recalcAllNow = recalcAllNow;
 window.signOutDevice = signOutDevice;
 window.addEntry = addEntry;
 window.addPerson = addPerson;
