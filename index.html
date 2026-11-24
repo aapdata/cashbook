@@ -147,6 +147,7 @@
   .overlay{ position:fixed; inset:0; background: rgba(43,33,24,0.55); z-index: 20; display:flex; align-items:flex-end; justify-content:center; }
   .overlay.center{ align-items:center; }
   .overlay.hidden{ display:none; }
+  .addperson.hidden{ display:none; }
   .sheet{ background: var(--paper); width:100%; max-width: 560px; max-height: 82vh; overflow-y:auto; border-radius: 14px 14px 0 0; padding: 16px 16px 26px 16px; }
   .overlay.center .sheet{ border-radius: 14px; max-height: 88vh; }
   .sheet h2{ font-family:'Fraunces', serif; font-size: 19px; margin: 4px 0 12px 0; }
@@ -280,6 +281,14 @@
     <h2>People</h2>
     <p class="sub">Everyone listed here keeps their own cash balance and can log in with their PIN.</p>
     <div id="usersList"></div>
+    <div class="addperson hidden" id="pinChangeBox">
+      <div id="pinChangeTitle" style="font-weight:600; margin-bottom:8px;"></div>
+      <input type="password" id="pcOld" class="pin" placeholder="Current PIN" maxlength="4" inputmode="numeric" pattern="[0-9]*">
+      <input type="password" id="pcNew" class="pin" placeholder="New 4-digit PIN" maxlength="4" inputmode="numeric" pattern="[0-9]*">
+      <input type="password" id="pcNew2" class="pin" placeholder="New PIN again" maxlength="4" inputmode="numeric" pattern="[0-9]*">
+      <button class="add-btn" onclick="savePinChange()">Save new PIN</button>
+      <button class="add-btn" style="margin-top:6px; background:transparent; color:var(--ink); border:1px solid var(--rule);" onclick="closePinChange()">Cancel</button>
+    </div>
     <div class="addperson">
       <input type="text" id="addName" placeholder="Name">
       <input type="text" id="addPin" class="pin" placeholder="4-digit PIN" maxlength="4" inputmode="numeric" pattern="[0-9]*">
@@ -433,7 +442,7 @@ async function safeSet(key, value){
 
 /* ---------- CONFIG / LOGIN ---------- */
 async function loadConfig(){ config = await safeGet('config'); }
-async function saveConfig(){ await safeSet('config', config); }
+async function saveConfig(){ return await safeSet('config', config); }
 
 function buildKeypad(){
   const kp = document.getElementById('keypad');
@@ -501,9 +510,39 @@ function switchUser(){ currentUser = null; document.getElementById('usersOverlay
 
 /* ---------- USERS MANAGEMENT ---------- */
 function openUsers(){ renderUsersList(); document.getElementById('usersOverlay').classList.remove('hidden'); }
-function closeUsers(){ document.getElementById('usersOverlay').classList.add('hidden'); }
+function closeUsers(){ closePinChange(); document.getElementById('usersOverlay').classList.add('hidden'); }
 function renderUsersList(){
-  document.getElementById('usersList').innerHTML = config.users.map(u=>`<div class="setup-user-row"><div class="dot" style="background:${u.color}"></div><div class="name">${escapeHtml(u.name)}${currentUser && currentUser.id===u.id ? ' (you)':''}</div><button class="rm" onclick="removePerson('${u.id}')">Remove</button></div>`).join('');
+  document.getElementById('usersList').innerHTML = config.users.map(u=>`<div class="setup-user-row"><div class="dot" style="background:${u.color}"></div><div class="name">${escapeHtml(u.name)}${currentUser && currentUser.id===u.id ? ' (you)':''}</div>${canChangePin(u) ? `<button class="rm" onclick="openPinChange('${u.id}')">Change PIN</button>` : ''}<button class="rm" onclick="removePerson('${u.id}')">Remove</button></div>`).join('');
+}
+// Each person can change their own PIN (needs the current PIN). The first person (owner) can also reset anyone's PIN.
+let pinChangeId = null;
+function canChangePin(u){ return !!currentUser && (currentUser.id === u.id || currentUser.id === config.users[0].id); }
+function openPinChange(id){
+  const u = config.users.find(x=>x.id===id); if(!u || !canChangePin(u)) return;
+  pinChangeId = id;
+  const own = currentUser.id === id;
+  document.getElementById('pinChangeTitle').textContent = 'Change PIN for ' + u.name;
+  document.getElementById('pcOld').style.display = own ? '' : 'none';
+  ['pcOld','pcNew','pcNew2'].forEach(k=>document.getElementById(k).value='');
+  document.getElementById('pinChangeBox').classList.remove('hidden');
+  document.getElementById(own ? 'pcOld' : 'pcNew').focus();
+}
+function closePinChange(){ pinChangeId = null; document.getElementById('pinChangeBox').classList.add('hidden'); }
+async function savePinChange(){
+  const u = config.users.find(x=>x.id===pinChangeId); if(!u || !canChangePin(u)){ closePinChange(); return; }
+  const own = currentUser.id === u.id;
+  const oldPin = document.getElementById('pcOld').value.trim();
+  const p1 = document.getElementById('pcNew').value.trim(), p2 = document.getElementById('pcNew2').value.trim();
+  if(own && oldPin !== u.pin){ showToast('Current PIN is wrong'); return; }
+  if(!/^\d{4}$/.test(p1)){ showToast('New PIN must be exactly 4 digits'); return; }
+  if(p1 !== p2){ showToast('The two new PINs do not match'); return; }
+  if(config.users.some(x=>x.id!==u.id && x.pin===p1)){ showToast('That PIN is already used — pick another'); return; }
+  if(p1 === u.pin){ showToast('That is already the PIN'); return; }
+  const before = u.pin; u.pin = p1;
+  const ok = await saveConfig();
+  if(ok === false){ u.pin = before; showToast('Could not save — PIN not changed'); return; }
+  closePinChange();
+  showToast('PIN changed for ' + u.name);
 }
 async function addPerson(){
   const name = document.getElementById('addName').value.trim();
@@ -1256,6 +1295,9 @@ window.pinBack = pinBack;
 window.pinClear = pinClear;
 window.pinPress = pinPress;
 window.removePerson = removePerson;
+window.openPinChange = openPinChange;
+window.closePinChange = closePinChange;
+window.savePinChange = savePinChange;
 window.reopenDay = reopenDay;
 window.setType = setType;
 window.setupAddPerson = setupAddPerson;
